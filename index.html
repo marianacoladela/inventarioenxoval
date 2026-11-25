@@ -43,6 +43,13 @@ td:first-child,th:first-child{text-align:left}
 tr.grupo td{background:var(--fundo);font-size:11px;text-transform:uppercase;color:var(--medio);font-weight:600;text-align:left}
 .log{margin:0 16px 6px;background:#fff;border:1px solid var(--gelo);border-radius:12px;padding:10px 12px;font-size:14px}
 .log .quando{font-size:11px;color:var(--medio)}
+.log .editado{font-size:11px;color:var(--medio);font-style:italic}
+.acoes{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+.acoes button{padding:7px 12px;border-radius:8px;border:1px solid var(--gelo);background:#fff;font-size:13px;color:var(--marinho);cursor:pointer}
+.acoes button.perigo{color:var(--alerta);border-color:var(--alerta)}
+.acoes button.principal{background:var(--floresta);color:#fff;border-color:var(--floresta)}
+.edicao{margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;color:var(--medio)}
+.edicao input{width:110px;padding:8px;border:1px solid var(--gelo);border-radius:8px;font-size:16px;color:var(--marinho)}
 .rodape{margin:24px 16px 0}
 .btn-salvar-tudo{width:100%;padding:16px;border:none;border-radius:14px;background:var(--floresta);color:#fff;font-size:17px;font-weight:600;cursor:pointer}
 .confirma{margin-top:10px;padding:10px 12px;border-radius:10px;background:#E4EDE7;color:var(--floresta);font-size:14px;display:none}
@@ -108,10 +115,11 @@ const UNIDADES = [["pinheiros","Pinheiros"],["vila-mariana","Vila Mariana"]];
 const NOMES_UNIDADES = {"pinheiros":"Pinheiros","vila-mariana":"Vila Mariana"};
 
 let tela = "resumo";
-let estado = {};
-let eventos = [];
+let eventos = [];        // todas as alterações, com _key do banco
+let estado = {};         // calculado a partir de eventos: "pinheiros-fronha" -> {inicial, usados, inicialPor, inicialEm}
 let rascunho = {};
 let confirmacao = "";
+let editando = null;     // {key, valor} enquanto uma alteração está sendo editada
 let resumoDia = diaLocal(new Date());
 
 const campoNome = document.getElementById("nome");
@@ -136,23 +144,36 @@ function aviso(t){
   b.textContent = t || "";
   b.style.display = t ? "block" : "none";
 }
-function grava(caminho, dados){
-  db.ref(RAIZ + "/" + caminho).set(dados).catch(() => aviso("Não consegui salvar. Confira a conexão e tente de novo."));
+function erroBanco(){ aviso("Não consegui salvar. Confira a conexão e tente de novo."); }
+
+// Tudo sai do histórico: o estado de cada item é calculado a partir das alterações.
+function recalcula(){
+  estado = {};
+  const ordem = [...eventos].sort((a, b) => (a.em || "").localeCompare(b.em || ""));
+  for (const e of ordem){
+    const k = chave(e.unidade, e.item);
+    const s = estado[k] || {inicial: null, usados: 0};
+    if ((e.tipo || "uso") === "inicial"){
+      s.inicial = e.para == null ? null : e.para;
+      s.inicialPor = e.por;
+      s.inicialEm = e.em;
+    } else {
+      s.usados += e.delta;
+    }
+    estado[k] = s;
+  }
 }
+
 function registra(ev){
-  db.ref(RAIZ + "/eventos").push(ev).catch(() => aviso("Não consegui registrar a alteração. Confira a conexão."));
+  db.ref(RAIZ + "/eventos").push(ev).catch(erroBanco);
 }
 
 function gravaInicial(u, id, texto, nomeQuem){
   const k = chave(u, id);
-  const s = estado[k] || {inicial: null, usados: 0};
+  const atual = estado[k] || {inicial: null, usados: 0};
   const novoInicial = texto === "" ? null : Math.max(0, parseInt(texto, 10));
-  const agora = new Date().toISOString();
-  const nv = {inicial: novoInicial, usados: s.usados, inicialPor: nomeQuem, inicialEm: agora};
-  estado[k] = nv;
   delete rascunho[k];
-  grava("estoque/" + k, nv);
-  registra({tipo: "inicial", unidade: u, item: id, de: s.inicial == null ? null : s.inicial, para: novoInicial, por: nomeQuem, em: agora, dia: diaLocal(new Date())});
+  registra({tipo: "inicial", unidade: u, item: id, de: atual.inicial == null ? null : atual.inicial, para: novoInicial, por: nomeQuem, em: new Date().toISOString(), dia: diaLocal(new Date())});
 }
 
 function salvaInicial(u, id){
@@ -185,16 +206,39 @@ function salvaTudo(u){
 
 function mudaUsados(u, id, delta){
   const k = chave(u, id);
-  const s = estado[k] || {inicial: null, usados: 0};
-  const novo = Math.max(0, s.usados + delta);
-  const real = novo - s.usados;
-  if (real === 0) return;
-  const nv = {...s, usados: novo};
-  estado[k] = nv;
+  const atual = estado[k] || {inicial: null, usados: 0};
+  if (delta < 0 && atual.usados <= 0) return;
   confirmacao = "";
+  registra({tipo: "uso", unidade: u, item: id, delta: delta, por: nomeAtual() || "sem nome", em: new Date().toISOString(), dia: diaLocal(new Date())});
+}
+
+// Editar ou excluir uma alteração. O estado é recalculado sozinho.
+function excluiEvento(key){
+  if (!confirm("Excluir esta alteração? O estoque será recalculado.")) return;
+  db.ref(RAIZ + "/eventos/" + key).remove().catch(erroBanco);
+}
+
+function salvaEdicao(){
+  if (!editando) return;
+  const nomeQuem = nomeAtual();
+  if (!nomeQuem) { aviso("Digite seu nome antes de editar."); campoNome.focus(); return; }
+  const ev = eventos.find(e => e._key === editando.key);
+  if (!ev) { editando = null; render(); return; }
+  const texto = String(editando.valor).trim();
+  const patch = {editadoPor: nomeQuem, editadoEm: new Date().toISOString()};
+  if ((ev.tipo || "uso") === "inicial"){
+    if (texto !== "" && isNaN(parseInt(texto, 10))) { aviso("Digite um número."); return; }
+    patch.para = texto === "" ? null : Math.max(0, parseInt(texto, 10));
+  } else {
+    const n = parseInt(texto, 10);
+    if (isNaN(n)) { aviso("Digite um número."); return; }
+    patch.delta = n;
+  }
+  db.ref(RAIZ + "/eventos/" + editando.key).update(patch)
+    .then(() => { aviso(""); })
+    .catch(erroBanco);
+  editando = null;
   render();
-  grava("estoque/" + k, nv);
-  registra({tipo: "uso", unidade: u, item: id, delta: real, por: nomeAtual() || "sem nome", em: new Date().toISOString(), dia: diaLocal(new Date())});
 }
 
 function somaUsos(u, item, dia, ate){
@@ -395,6 +439,7 @@ function renderHistorico(){
     return;
   }
   for (const e of lista){
+    const tipoInicial = (e.tipo || "uso") === "inicial";
     const box = document.createElement("div");
     box.className = "log";
     const quando = document.createElement("div");
@@ -402,13 +447,61 @@ function renderHistorico(){
     quando.textContent = formataData(e.em) + " · " + (e.por || "sem nome") + " · " + (NOMES_UNIDADES[e.unidade] || e.unidade);
     const texto = document.createElement("div");
     const item = NOMES_ITENS[e.item] || e.item;
-    if ((e.tipo || "uso") === "inicial") {
+    if (tipoInicial) {
       texto.textContent = item + ": estoque inicial de " + (e.de == null ? "—" : e.de) + " para " + (e.para == null ? "—" : e.para);
     } else {
       const sinal = e.delta > 0 ? "+" + e.delta : String(e.delta);
       texto.textContent = item + ": itens utilizados " + sinal;
     }
     box.append(quando, texto);
+
+    if (e.editadoEm) {
+      const ed = document.createElement("div");
+      ed.className = "editado";
+      ed.textContent = "editado por " + (e.editadoPor || "sem nome") + " em " + formataData(e.editadoEm);
+      box.appendChild(ed);
+    }
+
+    if (editando && editando.key === e._key) {
+      const linhaEd = document.createElement("div");
+      linhaEd.className = "edicao";
+      const rotEd = document.createElement("span");
+      rotEd.textContent = tipoInicial ? "Novo estoque inicial:" : "Novo valor de utilizados:";
+      const inpEd = document.createElement("input");
+      inpEd.type = "number";
+      inpEd.inputMode = "numeric";
+      inpEd.value = editando.valor;
+      inpEd.oninput = () => { editando.valor = inpEd.value; };
+      linhaEd.append(rotEd, inpEd);
+      box.appendChild(linhaEd);
+
+      const acoesEd = document.createElement("div");
+      acoesEd.className = "acoes";
+      const ok = document.createElement("button");
+      ok.className = "principal";
+      ok.textContent = "Salvar edição";
+      ok.onclick = salvaEdicao;
+      const cancela = document.createElement("button");
+      cancela.textContent = "Cancelar";
+      cancela.onclick = () => { editando = null; render(); };
+      acoesEd.append(ok, cancela);
+      box.appendChild(acoesEd);
+    } else {
+      const acoes = document.createElement("div");
+      acoes.className = "acoes";
+      const ed = document.createElement("button");
+      ed.textContent = "Editar";
+      ed.onclick = () => {
+        editando = {key: e._key, valor: tipoInicial ? (e.para == null ? "" : e.para) : e.delta};
+        render();
+      };
+      const ex = document.createElement("button");
+      ex.className = "perigo";
+      ex.textContent = "Excluir";
+      ex.onclick = () => excluiEvento(e._key);
+      acoes.append(ed, ex);
+      box.appendChild(acoes);
+    }
     main.appendChild(box);
   }
 }
@@ -416,6 +509,7 @@ function renderHistorico(){
 function trocaTela(t){
   tela = t;
   confirmacao = "";
+  editando = null;
   aviso("");
   render();
 }
@@ -424,14 +518,13 @@ document.getElementById("t-pinheiros").onclick = () => trocaTela("pinheiros");
 document.getElementById("t-vila-mariana").onclick = () => trocaTela("vila-mariana");
 document.getElementById("t-historico").onclick = () => trocaTela("historico");
 
-db.ref(RAIZ + "/estoque").on("value", snap => {
-  estado = snap.val() || {};
+// Escuta as alterações em tempo real (todas as pessoas veem a mesma coisa).
+db.ref(RAIZ + "/eventos").on("value", snap => {
+  const val = snap.val() || {};
+  eventos = Object.entries(val).map(([key, v]) => ({...v, _key: key}));
+  recalcula();
   render();
 }, () => aviso("Não consegui ler os dados. Confira a conexão."));
-db.ref(RAIZ + "/eventos").on("value", snap => {
-  eventos = Object.values(snap.val() || {});
-  render();
-}, () => aviso("Não consegui ler o histórico. Confira a conexão."));
 
 render();
 </script>
